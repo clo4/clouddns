@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+watch_file devshell.nix
+
+use flake
+
+source_env_if_exists .envrc.local

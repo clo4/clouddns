@@ -1,0 +1,12 @@
+[Unit]
+Description=Cloudflare DDNS Client
+After=network.target
+
+[Service]
+Type=oneshot
+Environment="DDNS_CONFIG_PATH=/path/to/config.json"
+Environment="DDNS_CACHE_PATH=/tmp"
+ExecStart=/path/to/clouddns
+
+[Install]
+WantedBy=multi-user.target
