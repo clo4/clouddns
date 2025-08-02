@@ -25,12 +25,36 @@ type DNSRecord struct {
 	ZoneID string `json:"zone_id"`
 	// RecordID is the ID for the DNS record to update. This is only exposed through the API.
 	RecordID string `json:"record_id"`
+	// Webhooks is a list of the webhook URLs that should be POSTed to on successful update.
+	// For Discord webhooks (URLs containing "discord.com/api/webhooks/"), only the IP address
+	// will be sent as the message content. For all other webhooks, a JSON payload will be sent
+	// with the following structure: { "record_name": <string>, "record_type": <string>, "ip_address": <string> }
+	// If the webhook times out (5 seconds) or returns a non-OK status, the URL will be retried
+	// 2 more times. If it never succeeds, it will not be retried.
+	Webhooks []string `json:"webhooks,omitempty"`
 }
 
 // DNSConfiguration holds separate lists of A and AAAA records
 type DNSConfiguration struct {
 	A    []DNSRecord `json:"a,omitempty"`
 	AAAA []DNSRecord `json:"aaaa,omitempty"`
+}
+
+// WebhookPayload represents the data sent to webhooks
+type WebhookPayload struct {
+	RecordName string `json:"record_name"`
+	RecordType string `json:"record_type"`
+	IPAddress  string `json:"ip_address"`
+}
+
+// DiscordWebhookPayload represents the simplified message sent to Discord
+type DiscordWebhookPayload struct {
+	Content string `json:"content"`
+}
+
+// Global webhook HTTP client with 5-second timeout
+var webhookClient = &http.Client{
+	Timeout: 5 * time.Second,
 }
 
 func loadDNSConfiguration() (DNSConfiguration, error) {
@@ -215,6 +239,142 @@ func getCurrentIP(client *http.Client, api string) (string, error) {
 	return strings.TrimSpace(string(ipBytes)), nil
 }
 
+// sendWebhook sends a webhook notification with retry logic
+func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error {
+	var jsonData []byte
+	var err error
+
+	// Check if this is a Discord webhook
+	isDiscordWebhook := strings.Contains(url, "discord.com/api/webhooks/")
+
+	if isDiscordWebhook {
+		// For Discord, send only the IP address
+		discordPayload := DiscordWebhookPayload{
+			Content: payload.IPAddress,
+		}
+		jsonData, err = json.Marshal(discordPayload)
+		logger = logger.With("webhook_type", "discord")
+	} else {
+		// For other webhooks, send the full payload
+		jsonData, err = json.Marshal(payload)
+		logger = logger.With("webhook_type", "standard")
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook payload: %w", err)
+	}
+
+	maxRetries := 3
+	baseDelay := 1 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		logger.Info("Sending webhook",
+			"url", url,
+			"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+			"record_name", payload.RecordName,
+			"ip_address", payload.IPAddress)
+
+		startTime := time.Now()
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			logger.Error("Failed to create webhook request",
+				"url", url,
+				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"error", err)
+			if attempt < maxRetries {
+				time.Sleep(baseDelay * time.Duration(attempt))
+				continue
+			}
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := webhookClient.Do(req)
+		responseTime := time.Since(startTime)
+
+		if err != nil {
+			logger.Error("Webhook request failed",
+				"url", url,
+				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"response_time_ms", responseTime.Milliseconds(),
+				"error", err)
+			if attempt < maxRetries {
+				time.Sleep(baseDelay * time.Duration(attempt))
+				continue
+			}
+			return fmt.Errorf("request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			logger.Info("Webhook sent successfully",
+				"url", url,
+				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"status_code", resp.StatusCode,
+				"response_time_ms", responseTime.Milliseconds())
+			return nil
+		}
+
+		// Read response body for error logging
+		body, _ := io.ReadAll(resp.Body)
+		logger.Error("Webhook returned non-OK status",
+			"url", url,
+			"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+			"status_code", resp.StatusCode,
+			"response_body", string(body),
+			"response_time_ms", responseTime.Milliseconds())
+
+		if attempt < maxRetries {
+			time.Sleep(baseDelay * time.Duration(attempt))
+		}
+	}
+
+	return fmt.Errorf("webhook failed after %d attempts", maxRetries)
+}
+
+// notifyWebhooks sends notifications to all configured webhooks concurrently
+func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, recordType string, ipAddress string) {
+	if len(webhooks) == 0 {
+		return
+	}
+
+	logger.Info("Starting webhook notifications",
+		"record_name", recordName,
+		"webhook_count", len(webhooks))
+
+	payload := WebhookPayload{
+		RecordName: recordName,
+		RecordType: recordType,
+		IPAddress:  ipAddress,
+	}
+
+	var wg sync.WaitGroup
+	for _, webhookURL := range webhooks {
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+
+			if err := sendWebhook(logger, url, payload); err != nil {
+				logger.Error("Webhook notification failed",
+					"url", url,
+					"record_name", recordName,
+					"error", err)
+			} else {
+				logger.Info("Webhook notification completed",
+					"url", url,
+					"record_name", recordName)
+			}
+		}(webhookURL)
+	}
+
+	wg.Wait()
+	logger.Info("Completed all webhook notifications",
+		"record_name", recordName,
+		"webhook_count", len(webhooks))
+}
+
 // syncRecord ensures that the DNS record is up-to-date with the current IP address.
 // If the cached IP matches the current IP, skip update for this record.
 func syncRecord(
@@ -287,6 +447,17 @@ func syncRecord(
 				"name", record.Name,
 				"record_id", record.RecordID,
 				"ip", currentIP)
+		}
+
+		// Send webhook notifications if configured
+		if len(record.Webhooks) > 0 {
+			notifyWebhooks(
+				logger.With("component", "webhook"),
+				record.Webhooks,
+				record.Name,
+				recordType,
+				currentIP,
+			)
 		}
 	}
 }
