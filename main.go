@@ -241,6 +241,7 @@ func getCurrentIP(client *http.Client, api string) (string, error) {
 
 // sendWebhook sends a webhook notification with retry logic
 func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error {
+	logger = logger.With("url", url)
 	var jsonData []byte
 	var err error
 
@@ -269,10 +270,8 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Info("Sending webhook",
-			"url", url,
-			"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
-			"record_name", payload.RecordName,
-			"ip_address", payload.IPAddress)
+			"attempt", attempt,
+			"max_retries", maxRetries)
 
 		startTime := time.Now()
 
@@ -280,7 +279,8 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 		if err != nil {
 			logger.Error("Failed to create webhook request",
 				"url", url,
-				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"attempt", attempt,
+				"max_retries", maxRetries,
 				"error", err)
 			if attempt < maxRetries {
 				time.Sleep(baseDelay * time.Duration(attempt))
@@ -296,8 +296,8 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 
 		if err != nil {
 			logger.Error("Webhook request failed",
-				"url", url,
-				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"attempt", attempt,
+				"max_retries", maxRetries,
 				"response_time_ms", responseTime.Milliseconds(),
 				"error", err)
 			if attempt < maxRetries {
@@ -310,8 +310,8 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			logger.Info("Webhook sent successfully",
-				"url", url,
-				"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
+				"attempt", attempt,
+				"max_retries", maxRetries,
 				"status_code", resp.StatusCode,
 				"response_time_ms", responseTime.Milliseconds())
 			return nil
@@ -320,7 +320,6 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 		// Read response body for error logging
 		body, _ := io.ReadAll(resp.Body)
 		logger.Error("Webhook returned non-OK status",
-			"url", url,
 			"attempt", fmt.Sprintf("%d/%d", attempt, maxRetries),
 			"status_code", resp.StatusCode,
 			"response_body", string(body),
@@ -336,12 +335,12 @@ func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error 
 
 // notifyWebhooks sends notifications to all configured webhooks concurrently
 func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, recordType string, ipAddress string) {
+	logger = logger.With("component", "webhook")
 	if len(webhooks) == 0 {
 		return
 	}
 
 	logger.Info("Starting webhook notifications",
-		"record_name", recordName,
 		"webhook_count", len(webhooks))
 
 	payload := WebhookPayload{
@@ -357,21 +356,15 @@ func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, r
 			defer wg.Done()
 
 			if err := sendWebhook(logger, url, payload); err != nil {
-				logger.Error("Webhook notification failed",
-					"url", url,
-					"record_name", recordName,
-					"error", err)
+				logger.Error("Webhook notification failed", "error", err)
 			} else {
-				logger.Info("Webhook notification completed",
-					"url", url,
-					"record_name", recordName)
+				logger.Info("Webhook notification completed")
 			}
 		}(webhookURL)
 	}
 
 	wg.Wait()
 	logger.Info("Completed all webhook notifications",
-		"record_name", recordName,
 		"webhook_count", len(webhooks))
 }
 
@@ -385,31 +378,23 @@ func syncRecord(
 	baseCachePath string,
 	currentIP string,
 ) {
+	logger = logger.With("record_id", record.RecordID, "record_name", record.Name)
 	cacheFileName := generateCacheFilename(record, recordType)
 	cachedIP, err := readCachedIP(baseCachePath, cacheFileName)
 	if err != nil {
-		logger.Warn("Failed to read cached IP for record",
-			"name", record.Name,
-			"record_id", record.RecordID,
-			"error", err)
+		logger.Warn("Failed to read cached IP for record", "error", err)
 		// Continue as if the cached IP is ""
 	}
 
 	// If cached IP address matches current IP address, skip update for this record
 	if cachedIP == currentIP {
-		logger.Info("IP address unchanged for record, skipping update",
-			"name", record.Name,
-			"record_id", record.RecordID,
-			"ip", currentIP)
+		logger.Info("IP address unchanged for record, skipping update", "ip", currentIP)
 		return
 	}
 
 	logger.Info("Updating DNS record",
-		"name", record.Name,
-		"record_id", record.RecordID,
 		"old_ip", cachedIP,
-		"new_ip", currentIP,
-		"record_type", recordType)
+		"new_ip", currentIP)
 
 	err = updateCloudflareRecord(
 		client,
@@ -418,41 +403,26 @@ func syncRecord(
 		currentIP)
 
 	if err != nil {
-		logger.Error("Failed to update DNS record",
-			"name", record.Name,
-			"record_id", record.RecordID,
-			"error", err)
+		logger.Error("Failed to update DNS record", "error", err)
 	} else {
-		logger.Info("Successfully updated DNS record",
-			"name", record.Name,
-			"record_id", record.RecordID,
-			"ip", currentIP)
+		logger.Info("Successfully updated DNS record", "ip", currentIP)
 
 		// Only cache IP for this record if the update was successful
 		if baseCachePath != "" {
 			err = writeCachedIP(baseCachePath, cacheFileName, currentIP)
 			if err != nil {
-				logger.Warn("Failed to save cached IP for record",
-					"name", record.Name,
-					"record_id", record.RecordID,
-					"error", err)
+				logger.Warn("Failed to save cached IP for record", "error", err)
 			} else {
-				logger.Info("Successfully cached new IP address for record",
-					"name", record.Name,
-					"record_id", record.RecordID,
-					"ip", currentIP)
+				logger.Info("Successfully cached new IP address for record", "ip", currentIP)
 			}
 		} else {
-			logger.Info("Not caching IP address because there is no DDNS_CACHE_PATH set",
-				"name", record.Name,
-				"record_id", record.RecordID,
-				"ip", currentIP)
+			logger.Info("Not caching IP address because there is no DDNS_CACHE_PATH set", "ip", currentIP)
 		}
 
 		// Send webhook notifications if configured
 		if len(record.Webhooks) > 0 {
 			notifyWebhooks(
-				logger.With("component", "webhook"),
+				logger,
 				record.Webhooks,
 				record.Name,
 				recordType,
@@ -485,9 +455,11 @@ type DNSUpdateConfig struct {
 }
 
 func syncRecordsToIPAddress(config DNSUpdateConfig) {
+	logger := config.logger.With("record_type", config.recordType)
+
 	currentIP, err := getCurrentIP(config.client, config.ipAPIURL)
 	if err != nil {
-		config.logger.Error("Failed to get current IP address", "error", err)
+		logger.Error("Failed to get current IP address", "error", err)
 		return
 	}
 
@@ -498,7 +470,7 @@ func syncRecordsToIPAddress(config DNSUpdateConfig) {
 		go func() {
 			defer wg.Done()
 			syncRecord(
-				config.logger,
+				logger,
 				config.client,
 				&config.records[i],
 				config.recordType,
@@ -534,7 +506,7 @@ func run(logger *slog.Logger) error {
 		go func() {
 			defer wg.Done()
 			syncRecordsToIPAddress(DNSUpdateConfig{
-				logger:        logger.With("record_type", "A"),
+				logger:        logger,
 				client:        client,
 				records:       configuration.A,
 				recordType:    "A",
@@ -551,7 +523,7 @@ func run(logger *slog.Logger) error {
 		go func() {
 			defer wg.Done()
 			syncRecordsToIPAddress(DNSUpdateConfig{
-				logger:        logger.With("record_type", "AAAA"),
+				logger:        logger,
 				client:        client,
 				records:       configuration.AAAA,
 				recordType:    "AAAA",
