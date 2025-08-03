@@ -463,6 +463,7 @@ type DNSUpdateConfig struct {
 
 func syncRecordsToIPAddress(config DNSUpdateConfig) {
 	logger := config.logger.With("record_type", config.recordType)
+	logger.Info("Beginning update for records", "count", len(config.records))
 
 	currentIP, err := getCurrentIP(config.client, config.ipAPIURL)
 	if err != nil {
@@ -508,7 +509,6 @@ func run(logger *slog.Logger) error {
 
 	a_records := len(configuration.A)
 	if a_records > 0 {
-		logger.Info("Updating A records", "count", a_records)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -525,7 +525,6 @@ func run(logger *slog.Logger) error {
 
 	aaaa_records := len(configuration.AAAA)
 	if aaaa_records > 0 {
-		logger.Info("Updating AAAA records", "count", aaaa_records)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
