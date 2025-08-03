@@ -52,11 +52,6 @@ type DiscordWebhookPayload struct {
 	Content string `json:"content"`
 }
 
-// Global webhook HTTP client with 5-second timeout
-var webhookClient = &http.Client{
-	Timeout: 5 * time.Second,
-}
-
 func loadDNSConfiguration() (DNSConfiguration, error) {
 	var configuration DNSConfiguration
 
@@ -240,7 +235,7 @@ func getCurrentIP(client *http.Client, api string) (string, error) {
 }
 
 // sendWebhook sends raw JSON data to a webhook URL with retry logic
-func sendWebhook(logger *slog.Logger, url string, jsonData []byte) error {
+func sendWebhook(logger *slog.Logger, client *http.Client, url string, jsonData []byte) error {
 	logger = logger.With("payload", string(jsonData))
 	maxRetries := 3
 	baseDelay := 1 * time.Second
@@ -268,7 +263,7 @@ func sendWebhook(logger *slog.Logger, url string, jsonData []byte) error {
 
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := webhookClient.Do(req)
+		resp, err := client.Do(req)
 		responseTime := time.Since(startTime)
 
 		if err != nil {
@@ -311,7 +306,7 @@ func sendWebhook(logger *slog.Logger, url string, jsonData []byte) error {
 }
 
 // notifyWebhooks sends notifications to all configured webhooks concurrently
-func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, recordType string, ipAddress string) {
+func notifyWebhooks(logger *slog.Logger, client *http.Client, webhooks []string, recordName string, recordType string, ipAddress string) {
 	logger = logger.With("component", "webhook")
 	if len(webhooks) == 0 {
 		return
@@ -360,7 +355,7 @@ func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, r
 				return
 			}
 
-			err = sendWebhook(logger, url, jsonData)
+			err = sendWebhook(logger, client, url, jsonData)
 
 			if err != nil {
 				logger.Error("Webhook notification failed", "error", err)
@@ -430,6 +425,7 @@ func syncRecord(
 		if len(record.Webhooks) > 0 {
 			notifyWebhooks(
 				logger,
+				client,
 				record.Webhooks,
 				record.Name,
 				recordType,
