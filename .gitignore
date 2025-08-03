@@ -5,4 +5,9 @@
 result
 result-*
 
+!.envrc.template
 .envrc
+
+.*
+cached_ip_*
+main
