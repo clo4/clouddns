@@ -239,32 +239,9 @@ func getCurrentIP(client *http.Client, api string) (string, error) {
 	return strings.TrimSpace(string(ipBytes)), nil
 }
 
-// sendWebhook sends a webhook notification with retry logic
-func sendWebhook(logger *slog.Logger, url string, payload WebhookPayload) error {
-	logger = logger.With("url", url)
-	var jsonData []byte
-	var err error
-
-	// Check if this is a Discord webhook
-	isDiscordWebhook := strings.Contains(url, "discord.com/api/webhooks/")
-
-	if isDiscordWebhook {
-		// For Discord, send only the IP address
-		discordPayload := DiscordWebhookPayload{
-			Content: payload.IPAddress,
-		}
-		jsonData, err = json.Marshal(discordPayload)
-		logger = logger.With("webhook_type", "discord")
-	} else {
-		// For other webhooks, send the full payload
-		jsonData, err = json.Marshal(payload)
-		logger = logger.With("webhook_type", "standard")
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to marshal webhook payload: %w", err)
-	}
-
+// sendWebhook sends raw JSON data to a webhook URL with retry logic
+func sendWebhook(logger *slog.Logger, url string, jsonData []byte) error {
+	logger = logger.With("payload", string(jsonData))
 	maxRetries := 3
 	baseDelay := 1 * time.Second
 
@@ -343,24 +320,54 @@ func notifyWebhooks(logger *slog.Logger, webhooks []string, recordName string, r
 	logger.Info("Starting webhook notifications",
 		"webhook_count", len(webhooks))
 
-	payload := WebhookPayload{
-		RecordName: recordName,
-		RecordType: recordType,
-		IPAddress:  ipAddress,
-	}
-
 	var wg sync.WaitGroup
 	for _, webhookURL := range webhooks {
 		wg.Add(1)
-		go func(url string) {
+		go func(url string, logger *slog.Logger) {
 			defer wg.Done()
 
-			if err := sendWebhook(logger, url, payload); err != nil {
+			logger = logger.With("url", url)
+
+			var jsonData []byte
+			var err error
+
+			// Check if this is a Discord webhook
+			isDiscordWebhook := strings.HasPrefix(url, "https://discord.com/api/webhooks/")
+
+			if isDiscordWebhook {
+				// For Discord, send only the IP address
+				discordPayload := DiscordWebhookPayload{
+					Content: ipAddress,
+				}
+				jsonData, err = json.Marshal(discordPayload)
+				logger.Info("Preparing Discord webhook")
+			} else {
+				// For other webhooks, send the full payload
+				payload := WebhookPayload{
+					RecordName: recordName,
+					RecordType: recordType,
+					IPAddress:  ipAddress,
+				}
+
+				jsonData, err = json.Marshal(payload)
+				logger.Info("Preparing standard webhook")
+			}
+
+			if err != nil {
+				logger.Error("Failed to marshal webhook payload",
+					"url", url,
+					"error", err)
+				return
+			}
+
+			err = sendWebhook(logger, url, jsonData)
+
+			if err != nil {
 				logger.Error("Webhook notification failed", "error", err)
 			} else {
 				logger.Info("Webhook notification completed")
 			}
-		}(webhookURL)
+		}(webhookURL, logger)
 	}
 
 	wg.Wait()
